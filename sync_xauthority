@@ -1,0 +1,15 @@
+# sync xauthority between users
+SOURCE_USER="username"
+SOURCE_XAUTH="/home/$SOURCE_USER/.Xauthority"
+TARGET_XAUTH="/home/oracle/.Xauthority"
+ 
+# check for current user and DISPLAY_VAR
+if [ "$USER" == "root" ] && [ -n "$DISPLAY" ]; then
+    if [ -f "$SOURCE_XAUTH" ]; then
+        # Copy .Xauthority-Datei
+        cp "$SOURCE_XAUTH" "$TARGET_XAUTH"
+        chown oracle:oinstall "$TARGET_XAUTH"
+    else
+        echo "Warning: $SOURCE_XAUTH doesn't exists or not readable."
+    fi
+fi
