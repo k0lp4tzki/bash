@@ -2,6 +2,8 @@
 # Prompted by Dennis Kolpatzki (https://kolpatzki.de) and written by ChatGPT 4.0
 # because I'm lazy and need fast solutions to first-world problems.
 #docmost script to delete users because a official way is not implemented yet.
+#Thanks to @mahmoud-samy from Github for contributing the page_history constraint
+
 
 # 🚀 PostgreSQL & Docker-Container Configuration
 DB_USER="docmost"
@@ -64,6 +66,7 @@ UPDATE pages SET creator_id = NULL WHERE creator_id = '$USER_ID';
 UPDATE pages SET last_updated_by_id = NULL WHERE last_updated_by_id = '$USER_ID';
 UPDATE pages SET deleted_by_id = NULL WHERE deleted_by_id = '$USER_ID';
 UPDATE workspace_invitations SET invited_by_id = NULL WHERE invited_by_id = '$USER_ID';
+UPDATE page_history SET last_updated_by_id = NULL WHERE last_updated_by_id = '$USER_ID';
 "
 
 # 🗑 Delete user
