@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+# -----------------------------------------------------------------------------
+# Project: Oracle (RAC) Healthcheck
+# File   : logfinder.sh
+# Author : Dennis Kolpatzki 
+# License: KFUL 1.0 License
+# Description:
+#   Interactive/non-interactive script to fetch ASM, Database, CRS, and Listener logs
+#   from Oracle ADR homes, with optional grep and zip features.
+#  In default, the last 100 lines are fetched for quick overview.
+# Usage:
+#   ./logfinder.sh [options] [component]
+#   Options:
+#     -z    zip fetched logs into /tmp/logs_<timestamp>.zip
+#     -g    grep each log for errors, warnings, ORA- patterns
+#     -h    show help and exit
+#   Components (case-insensitive): asm, database, crs, listener, all
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+IFS=$'\n'
+
+# Print help header (English, lowercase options)
+print_help() {
+  cat <<EOF
+usage: $0 [options]
+
+if no options given, interactive mode starts after this help.
+
+options:
+  -z    zip all fetched logs into /tmp/logs_<timestamp>.zip
+  -g    grep each log for errors, warnings, ORA- patterns
+  -h    show this help and then enter interactive mode
+
+interactive options (choose one):
+  asm
+  database
+  crs
+  listener
+  all
+  cancel
+EOF
+}
+
+# If no args or -h, print help and continue to menu
+if [[ $# -eq 0 ]]; then
+  print_help
+elif [[ "$1" == "-h" || "$1" == "--help" ]]; then
+  print_help
+  shift
+fi
+
+# parse flags
+ZIP=false
+GREP=false
+while [[ $# -gt 0 && "$1" =~ ^- ]]; do
+  case "$1" in
+    -z) ZIP=true; shift;;
+    -g) GREP=true; shift;;
+    -h|--help) shift;;
+    *) echo "unknown option: $1" >&2; print_help; exit 1;;
+  esac
+done
+
+# Fetch ADRCI homes
+adr_output=$(echo "show homes" | adrci 2>/dev/null)
+BASE=$(echo "$adr_output" | grep '^ADR base' | head -n1 | awk -F'"' '{print $2}')
+if [[ -z "$BASE" ]]; then
+  echo "no adr base found, please enable adrci" >&2
+  exit 1
+fi
+
+# Extract homes
+readarray -t homes_lines < <(echo "$adr_output" | sed -n 's|^diag/.*|&|p')
+declare -a homes_database homes_asm homes_crs homes_listener
+for rel in "${homes_lines[@]}"; do
+  full="$BASE/$rel"
+  case "$rel" in
+    diag/rdbms/*/*) homes_database+=("$full");;
+    diag/asm/*/*) homes_asm+=("$full");;
+    diag/crs/*/*) homes_crs+=("$full");;
+    diag/tnslsnr/*/*) homes_listener+=("$full");;
+  esac
+done
+
+# Warnings
+(( ${#homes_asm[@]} == 0 )) && echo "warning: no asm homes found, use grid user for asm logs"
+(( ${#homes_listener[@]} == 0 )) && echo "warning: no listener homes found, use grid user for listener logs"
+
+# Prepare zip tmp dir
+[[ "$ZIP" == true ]] && TMPZIP=$(mktemp -d)
+
+# Display logs function
+display_logs() {
+  local comp="$1"; shift
+  local arr=("$@")
+  echo -e "\n===== logs for $comp ====="
+  local found=false
+  for home in "${arr[@]}"; do
+    local trace_dir="$home/trace"
+    [[ -d "$trace_dir" ]] || continue
+    mapfile -t alerts < <(find "$trace_dir" -maxdepth 1 -type f -name "alert*.log" 2>/dev/null)
+    if (( ${#alerts[@]} > 0 )); then
+      for log in "${alerts[@]}"; do
+        found=true; echo -e "\n--- $log ---"; tail -n 100 "$log"
+        [[ "$GREP" == true ]] && grep -iE "error|warn|ORA-" "$log" || true
+        [[ "$ZIP" == true ]] && cp "$log" "$TMPZIP/"
+      done
+    else
+      local latest=$(find "$trace_dir" -maxdepth 1 -type f -name "*.log" -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n1 | cut -d' ' -f2-)
+      if [[ -n "$latest" ]]; then
+        found=true; echo -e "\n--- $latest (latest log) ---"; tail -n 100 "$latest"
+        [[ "$GREP" == true ]] && grep -iE "error|warn|ORA-" "$latest" || true
+        [[ "$ZIP" == true ]] && cp "$latest" "$TMPZIP/"
+      fi
+    fi
+  done
+  $found || echo "no logs found for $comp"
+}
+
+# Interactive menu
+PS3="choose your logfile: "
+options=("asm" "database" "crs" "listener" "all" "cancel")
+select opt in "${options[@]}"; do
+  case "$opt" in
+    asm) display_logs asm "${homes_asm[@]}"; break;;
+    database) display_logs database "${homes_database[@]}"; break;;
+    crs) display_logs crs "${homes_crs[@]}"; break;;
+    listener) display_logs listener "${homes_listener[@]}"; break;;
+    all)
+      display_logs asm "${homes_asm[@]}"
+      display_logs database "${homes_database[@]}"
+      display_logs crs "${homes_crs[@]}"
+      display_logs listener "${homes_listener[@]}"
+      break;;
+    cancel) echo "operation canceled"; exit 0;;
+    *) echo "invalid option: $REPLY";;
+  esac
+done
+
+# Zip after menu
+if [[ "$ZIP" == true ]]; then
+  ZIPFILE="/tmp/logs_$(date +%Y%m%d_%H%M%S).zip"
+  (cd "$TMPZIP" && zip -r "$ZIPFILE" .)
+  echo "logs archived to $ZIPFILE"
+  rm -rf "$TMPZIP"
+fi
+ 
