@@ -14,7 +14,9 @@
 #     -z    zip fetched logs into /tmp/logs_<timestamp>.zip
 #     -g    grep each log for errors, warnings, ORA- patterns
 #     -h    show help and exit
+#     -s    single option just for prettier view
 #   Components (case-insensitive): asm, database, crs, listener, all
+#   Update: added -s option reduce output for single instance
 # -----------------------------------------------------------------------------
 
 set -euo pipefail
@@ -31,7 +33,7 @@ options:
   -z    zip all fetched logs into /tmp/logs_<timestamp>.zip
   -g    grep each log for errors, warnings, ORA- patterns
   -h    show this help and then enter interactive mode
-
+  -s    reduces options to single instance (database / listener only)
 interactive options (choose one):
   asm
   database
@@ -53,14 +55,23 @@ fi
 # parse flags
 ZIP=false
 GREP=false
+SINGLE=false
 while [[ $# -gt 0 && "$1" =~ ^- ]]; do
   case "$1" in
     -z) ZIP=true; shift;;
     -g) GREP=true; shift;;
-    -h|--help) shift;;
+    -s) SINGLE=true; shift;;   # <-- neu
+    -h|--help) print_help; exit;;
     *) echo "unknown option: $1" >&2; print_help; exit 1;;
   esac
 done
+
+# Arrays zur Vermeidung von “unbound variable”
+homes_asm=()
+homes_database=()
+homes_crs=()
+homes_listener=()
+
 
 # Fetch ADRCI homes
 adr_output=$(echo "show homes" | adrci 2>/dev/null)
@@ -76,16 +87,26 @@ declare -a homes_database homes_asm homes_crs homes_listener
 for rel in "${homes_lines[@]}"; do
   full="$BASE/$rel"
   case "$rel" in
-    diag/rdbms/*/*) homes_database+=("$full");;
-    diag/asm/*/*) homes_asm+=("$full");;
-    diag/crs/*/*) homes_crs+=("$full");;
-    diag/tnslsnr/*/*) homes_listener+=("$full");;
+    diag/asm/*/*)
+      [[ "$SINGLE" == false ]] && homes_asm+=( "$full" )
+      ;;
+    diag/rdbms/*/*)
+      homes_database+=( "$full" )
+      ;;
+    diag/crs/*/*)
+      [[ "$SINGLE" == false ]] && homes_crs+=( "$full" )
+      ;;
+    diag/tnslsnr/*/*)
+      homes_listener+=( "$full" )
+      ;;
   esac
 done
 
 # Warnings
+if [[ "$SINGLE" == false ]]; then
 (( ${#homes_asm[@]} == 0 )) && echo "warning: no asm homes found, use grid user for asm logs"
 (( ${#homes_listener[@]} == 0 )) && echo "warning: no listener homes found, use grid user for listener logs"
+fi
 
 # Prepare zip tmp dir
 [[ "$ZIP" == true ]] && TMPZIP=$(mktemp -d)
@@ -117,24 +138,56 @@ display_logs() {
   done
   $found || echo "no logs found for $comp"
 }
+# Baue Menü-Optionen dynamisch
+options=( "database" "listener" )
+if [[ "$SINGLE" == false ]]; then
+  options=( "asm" "crs" "${options[@]}" )
+fi
+options+=( "all" "cancel" )
 
-# Interactive menu
-PS3="choose your logfile: "
-options=("asm" "database" "crs" "listener" "all" "cancel")
+PS3="choose your option:[1-6] "
 select opt in "${options[@]}"; do
   case "$opt" in
-    asm) display_logs asm "${homes_asm[@]}"; break;;
-    database) display_logs database "${homes_database[@]}"; break;;
-    crs) display_logs crs "${homes_crs[@]}"; break;;
-    listener) display_logs listener "${homes_listener[@]}"; break;;
-    all)
-      display_logs asm "${homes_asm[@]}"
+    asm)
+      if [[ "$SINGLE" == false ]]; then
+        display_logs asm "${homes_asm[@]}"
+      else
+        echo "ASM not available in single-instance mode"
+      fi
+      break
+      ;;
+    crs)
+      if [[ "$SINGLE" == false ]]; then
+        display_logs crs "${homes_crs[@]}"
+      else
+        echo "CRS not available in single-instance mode"
+      fi
+      break
+      ;;
+    database)
       display_logs database "${homes_database[@]}"
-      display_logs crs "${homes_crs[@]}"
+      break
+      ;;
+    listener)
       display_logs listener "${homes_listener[@]}"
-      break;;
-    cancel) echo "operation canceled"; exit 0;;
-    *) echo "invalid option: $REPLY";;
+      break
+      ;;
+    all)
+      display_logs database "${homes_database[@]}"
+      display_logs listener "${homes_listener[@]}"
+      if [[ "$SINGLE" == false ]]; then
+        display_logs asm "${homes_asm[@]}"
+        display_logs crs "${homes_crs[@]}"
+      fi
+      break
+      ;;
+    cancel)
+      echo "operation canceled"
+      exit 0
+      ;;
+    *)
+      echo "invalid option: $REPLY"
+      ;;
   esac
 done
 
@@ -145,4 +198,3 @@ if [[ "$ZIP" == true ]]; then
   echo "logs archived to $ZIPFILE"
   rm -rf "$TMPZIP"
 fi
- 
