@@ -9,192 +9,436 @@
 #   from Oracle ADR homes, with optional grep and zip features.
 #  In default, the last 100 lines are fetched for quick overview.
 # Usage:
-#   ./logfinder.sh [options] [component]
+#   ./logfinder.sh [for interactive mode]
+#   ./logfinder.sh -z for zipping logfiles after interactive mode
+#   ./logfinder.sh [component] to execute [database/asm/crs/listener] directly without interactive menu
 #   Options:
 #     -z    zip fetched logs into /tmp/logs_<timestamp>.zip
 #     -g    grep each log for errors, warnings, ORA- patterns
 #     -h    show help and exit
-#     -s    single option just for prettier view
-#   Components (case-insensitive): asm, database, crs, listener, all
-#   Update: added -s option reduce output for single instance
+#     
+#   Components (case-insensitive): asm, database, crs, listener, all# 
+#   Update: improved error handling, debug outputs (if activated); 
+#   
 # -----------------------------------------------------------------------------
 
-set -euo pipefail
+set -o pipefail
 IFS=$'\n'
 
-# Print help header (English, lowercase options)
+# Print help header with ASCII formatting
 print_help() {
   cat <<EOF
-usage: $0 [options]
+============================================================
+                    Oracle Log Fetcher
+============================================================
+Usage: $0 [options] [component]
 
-if no options given, interactive mode starts after this help.
+If no component is specified, interactive mode starts after this help.
 
-options:
-  -z    zip all fetched logs into /tmp/logs_<timestamp>.zip
-  -g    grep each log for errors, warnings, ORA- patterns
-  -h    show this help and then enter interactive mode
-  -s    reduces options to single instance (database / listener only)
-interactive options (choose one):
-  asm
-  database
-  crs
-  listener
+Options:
+  -z    Zip all fetched logs into /tmp/logs_<timestamp>.zip
+  -g    Grep each log for errors, warnings, ORA- patterns
+  -h    Show this help and then enter interactive mode
+
+Components:
+  asm       (requires Grid Infrastructure environment)
+  database  (requires Oracle Database environment)
+  crs       (requires Grid Infrastructure environment)
+  listener  (requires Grid Infrastructure environment if running on RAC)
   all
-  cancel
+
+============================================================
 EOF
 }
 
-# If no args or -h, print help and continue to menu
-if [[ $# -eq 0 ]]; then
-  print_help
-elif [[ "$1" == "-h" || "$1" == "--help" ]]; then
-  print_help
-  shift
-fi
+# Function to get current user
+get_current_user() {
+  whoami
+}
 
-# parse flags
-ZIP=false
-GREP=false
-SINGLE=false
-while [[ $# -gt 0 && "$1" =~ ^- ]]; do
-  case "$1" in
-    -z) ZIP=true; shift;;
-    -g) GREP=true; shift;;
-    -s) SINGLE=true; shift;;   # <-- neu
-    -h|--help) print_help; exit;;
-    *) echo "unknown option: $1" >&2; print_help; exit 1;;
-  esac
-done
+# Function to evaluate permissions and environment
+evaluate_permissions() {
+  local user="$1"
+  local profile="/home/$user/.bash_profile"
 
-# Arrays zur Vermeidung von “unbound variable”
-homes_asm=()
-homes_database=()
-homes_crs=()
-homes_listener=()
+  # Debug: Print environment
+  # echo "debug: Evaluating environment for user $user, PATH=$PATH" >&2
+  # echo "debug: ORACLE_HOME=$ORACLE_HOME, ORACLE_BASE=$ORACLE_BASE, ORACLE_SID=$ORACLE_SID" >&2
 
+  # Load user's shell profile to mimic interactive environment
+  if [[ -f "$profile" ]]; then
+    # echo "debug: Sourcing $profile for $user" >&2
+    source "$profile" || echo "warning: Failed to source $profile for $user" >&2
+  else
+       echo "No .bash_profile found for $user" >&2
+  fi
 
-# Fetch ADRCI homes
-adr_output=$(echo "show homes" | adrci 2>/dev/null)
-BASE=$(echo "$adr_output" | grep '^ADR base' | head -n1 | awk -F'"' '{print $2}')
-if [[ -z "$BASE" ]]; then
-  echo "no adr base found, please enable adrci" >&2
-  exit 1
-fi
+  # Check if adrci is available
+  if ! command -v adrci >/dev/null; then
+    echo "error: adrci not found for $user, check PATH or Oracle installation" >&2
+    return 1
+  fi
 
-# Extract homes
-readarray -t homes_lines < <(echo "$adr_output" | sed -n 's|^diag/.*|&|p')
-declare -a homes_database homes_asm homes_crs homes_listener
-for rel in "${homes_lines[@]}"; do
-  full="$BASE/$rel"
-  case "$rel" in
-    diag/asm/*/*)
-      [[ "$SINGLE" == false ]] && homes_asm+=( "$full" )
-      ;;
-    diag/rdbms/*/*)
-      homes_database+=( "$full" )
-      ;;
-    diag/crs/*/*)
-      [[ "$SINGLE" == false ]] && homes_crs+=( "$full" )
-      ;;
-    diag/tnslsnr/*/*)
-      homes_listener+=( "$full" )
-      ;;
-  esac
-done
+  # Fetch ADRCI homes to determine environment type
+  local adr_output
+  adr_output=$(adrci exec="show base; show homes" 2>/dev/null) || {
+    echo "warning: Failed to fetch ADRCI homes for $user" >&2
+    return 1
+  }
+  #echo "debug: ADRCI output for $user: $adr_output" >&2
 
-# Warnings
-if [[ "$SINGLE" == false ]]; then
-(( ${#homes_asm[@]} == 0 )) && echo "warning: no asm homes found, use grid user for asm logs"
-(( ${#homes_listener[@]} == 0 )) && echo "warning: no listener homes found, use grid user for listener logs"
-fi
+  # Extract ADR base
+  local base_dir
+  base_dir=$(echo "$adr_output" | grep '^ADR base' | head -n1 | awk -F'"' '{print $2}' || true)
+  if [[ -z "$base_dir" ]]; then
+    # Fallback: Try to derive from ORACLE_BASE
+    base_dir="${ORACLE_BASE:-/oracle/$user/base}"
+    # echo "debug: Using fallback ADR base: $base_dir" >&2
+  fi
+  # echo "debug: ADR base for $user: $base_dir" >&2
 
-# Prepare zip tmp dir
-[[ "$ZIP" == true ]] && TMPZIP=$(mktemp -d)
+  # Determine environment type based on ADRCI homes
+  local has_database=false has_asm=false has_crs=false has_listener=false
+  if echo "$adr_output" | grep -q 'diag/rdbms/'; then
+    has_database=true
+  fi
+  if echo "$adr_output" | grep -q 'diag/asm/'; then
+    has_asm=true
+  fi
+  if echo "$adr_output" | grep -q 'diag/crs/'; then
+    has_crs=true
+  fi
+  if echo "$adr_output" | grep -q 'diag/tnslsnr/'; then
+    has_listener=true
+  fi
 
-# Display logs function
+  # Return environment capabilities and base directory
+  echo "base_dir=$base_dir has_database=$has_database has_asm=$has_asm has_crs=$has_crs has_listener=$has_listener"
+}
+
+# Fetch ADRCI homes for specified component
+fetch_homes() {
+  local component="$1"
+  local user="$2"
+  local base_dir="$3"
+  local adr_output
+
+  # Fetch ADRCI homes
+  if ! adr_output=$(adrci exec="show homes" 2>/dev/null); then
+    echo "warning: Could not fetch homes for $user" >&2
+    return 1
+  fi
+
+  # Initialize arrays
+  declare -a homes
+  readarray -t home_lines < <(echo "$adr_output" | sed -n 's|^diag/.*|&|p')
+  for rel in "${home_lines[@]}"; do
+    local full="$base_dir/$rel"
+    case "$rel" in
+      diag/rdbms/*/*)
+        [[ "$component" == "database" || "$component" == "all" ]] && homes+=("$full")
+        ;;
+      diag/asm/*/*)
+        [[ "$component" == "asm" || "$component" == "all" ]] && homes+=("$full")
+        ;;
+      diag/crs/*/*)
+        [[ "$component" == "crs" || "$component" == "all" ]] && homes+=("$full")
+        ;;
+      diag/tnslsnr/*/*)
+        [[ "$component" == "listener" || "$component" == "all" ]] && homes+=("$full")
+        ;;
+    esac
+  done
+
+  # Return homes
+  printf '%s\n' "${homes[@]}"
+}
+
+# Display logs for a component
 display_logs() {
   local comp="$1"; shift
   local arr=("$@")
-  echo -e "\n===== logs for $comp ====="
+  local user="$CURRENT_USER"
+
+  echo -e "\n============================================================"
+  echo " Logs for $comp"
+  echo -e "============================================================\n"
+
   local found=false
   for home in "${arr[@]}"; do
     local trace_dir="$home/trace"
-    [[ -d "$trace_dir" ]] || continue
-    mapfile -t alerts < <(find "$trace_dir" -maxdepth 1 -type f -name "alert*.log" 2>/dev/null)
+    [[ -d "$trace_dir" ]] || {
+      # echo "debug: Trace directory $trace_dir does not exist" >&2
+      continue
+    }
+    mapfile -t alerts < <(find "$trace_dir" -maxdepth 1 -type f -name "alert*.log" 2>/dev/null || true)
     if (( ${#alerts[@]} > 0 )); then
       for log in "${alerts[@]}"; do
-        found=true; echo -e "\n--- $log ---"; tail -n 100 "$log"
-        [[ "$GREP" == true ]] && grep -iE "error|warn|ORA-" "$log" || true
-        [[ "$ZIP" == true ]] && cp "$log" "$TMPZIP/"
+        found=true
+        echo -e "\n--- $log ---\n"
+        # echo "debug: Processing log $log as $user" >&2
+        if tail -n 100 "$log" 2>/dev/null; then
+          [[ "$GREP" == true ]] && grep -iE "error|warn|ORA-" "$log" 2>/dev/null || true
+          if [[ "$ZIP" == true ]]; then
+            # echo "debug: Attempting to copy $log to $TMPZIP/$(basename "$log") as $user" >&2
+            # echo "debug: Log file permissions:" >&2
+            ls -l "$log" >&2
+            # echo "debug: TMPZIP directory permissions:" >&2
+            ls -ld "$TMPZIP" >&2
+            cat "$log" > "$TMPZIP/$(basename "$log")" 2>/dev/null || {
+              echo "warning: Unable to copy $log to $TMPZIP/$(basename "$log")" >&2
+              ls -l "$log" >&2
+              ls -ld "$TMPZIP" >&2
+              # echo "debug: Checking if TMPZIP is writable:" >&2
+              touch "$TMPZIP/testfile" 2>/dev/null && echo "debug: TMPZIP is writable" >&2 || echo "debug: TMPZIP is not writable" >&2
+            }
+          fi
+        else
+          echo "warning: Unable to read $log" >&2
+          ls -l "$log" >&2
+        fi
       done
     else
-      local latest=$(find "$trace_dir" -maxdepth 1 -type f -name "*.log" -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n1 | cut -d' ' -f2-)
+      local latest
+      latest=$(find "$trace_dir" -maxdepth 1 -type f -name "*.log" -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n1 | cut -d' ' -f2- || true)
       if [[ -n "$latest" ]]; then
-        found=true; echo -e "\n--- $latest (latest log) ---"; tail -n 100 "$latest"
-        [[ "$GREP" == true ]] && grep -iE "error|warn|ORA-" "$latest" || true
-        [[ "$ZIP" == true ]] && cp "$latest" "$TMPZIP/"
+        found=true
+        echo -e "\n--- $latest (latest log) ---\n"
+        # echo "debug: Processing log $latest as $user" >&2
+        if tail -n 100 "$latest" 2>/dev/null; then
+          [[ "$GREP" == true ]] && grep -iE "error|warn|ORA-" "$latest" 2>/dev/null || true
+          if [[ "$ZIP" == true ]]; then
+            # echo "debug: Attempting to copy $latest to $TMPZIP/$(basename "$latest") as $user" >&2
+            # echo "debug: Log file permissions:" >&2
+            ls -l "$latest" >&2
+            # echo "debug: TMPZIP directory permissions:" >&2
+            ls -ld "$TMPZIP" >&2
+            cat "$latest" > "$TMPZIP/$(basename "$latest")" 2>/dev/null || {
+              echo "warning: Unable to copy $latest to $TMPZIP/$(basename "$latest")" >&2
+              ls -l "$latest" >&2
+              ls -ld "$TMPZIP" >&2
+              # echo "debug: Checking if TMPZIP is writable:" >&2
+              touch "$TMPZIP/testfile" 2>/dev/null && echo "debug: TMPZIP is writable" >&2 || echo "debug: TMPZIP is not writable" >&2
+            }
+          fi
+        else
+          echo "warning: Unable to read $latest" >&2
+          ls -l "$latest" >&2
+        fi
       fi
     fi
   done
-  $found || echo "no logs found for $comp"
+  $found || echo "No logs found for $comp"
+  echo -e "\n============================================================"
 }
-# Baue Menü-Optionen dynamisch
-options=( "database" "listener" )
-if [[ "$SINGLE" == false ]]; then
-  options=( "asm" "crs" "${options[@]}" )
-fi
-options+=( "all" "cancel" )
 
-PS3="choose your option:[1-6] "
-select opt in "${options[@]}"; do
-  case "$opt" in
-    asm)
-      if [[ "$SINGLE" == false ]]; then
-        display_logs asm "${homes_asm[@]}"
-      else
-        echo "ASM not available in single-instance mode"
-      fi
-      break
-      ;;
-    crs)
-      if [[ "$SINGLE" == false ]]; then
-        display_logs crs "${homes_crs[@]}"
-      else
-        echo "CRS not available in single-instance mode"
-      fi
-      break
-      ;;
-    database)
-      display_logs database "${homes_database[@]}"
-      break
-      ;;
-    listener)
-      display_logs listener "${homes_listener[@]}"
-      break
-      ;;
-    all)
-      display_logs database "${homes_database[@]}"
-      display_logs listener "${homes_listener[@]}"
-      if [[ "$SINGLE" == false ]]; then
-        display_logs asm "${homes_asm[@]}"
-        display_logs crs "${homes_crs[@]}"
-      fi
-      break
-      ;;
-    cancel)
-      echo "operation canceled"
-      exit 0
-      ;;
-    *)
-      echo "invalid option: $REPLY"
-      ;;
+# Parse flags and component
+ZIP=false
+GREP=false
+COMPONENT=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -z) ZIP=true; shift;;
+    -g) GREP=true; shift;;
+    -h|--help) print_help; shift; break;;
+    asm|database|crs|listener|all) COMPONENT="$1"; shift; break;;
+    *) echo "error: Unknown option or component: $1" >&2; print_help; exit 1;;
   esac
 done
 
-# Zip after menu
+# Get current user
+CURRENT_USER=$(get_current_user)
+#echo "debug: Current user is $CURRENT_USER" >&2
+
+# Evaluate permissions
+perm_output=$(evaluate_permissions "$CURRENT_USER")
+eval "$perm_output"
+
+# Determine available components based on environment
+declare -a available_components
+if [[ "$has_database" == true ]]; then
+  available_components+=("database")
+fi
+if [[ "$has_asm" == true ]]; then
+  available_components+=("asm")
+fi
+if [[ "$has_crs" == true ]]; then
+  available_components+=("crs")
+fi
+if [[ "$has_listener" == true ]]; then
+  available_components+=("listener")
+fi
+[[ ${#available_components[@]} -gt 0 ]] && available_components+=("all")
+
+# Initialize arrays for homes
+declare -a homes_database homes_asm homes_crs homes_listener
+
+# Fetch homes based on component
+if [[ -n "$COMPONENT" ]]; then
+  case "$COMPONENT" in
+    asm)
+      if [[ "$has_asm" == true ]]; then
+        readarray -t homes_asm < <(fetch_homes "asm" "$CURRENT_USER" "$base_dir")
+      else
+        echo "warning: asm requires Grid Infrastructure environment, execute as a grid user" >&2
+        exit 1
+      fi
+      ;;
+    database)
+      if [[ "$has_database" == true ]]; then
+        readarray -t homes_database < <(fetch_homes "database" "$CURRENT_USER" "$base_dir")
+      else
+        echo "warning: database requires Oracle Database environment, execute as a database user" >&2
+        exit 1
+      fi
+      ;;
+    crs)
+      if [[ "$has_crs" == true ]]; then
+        readarray -t homes_crs < <(fetch_homes "crs" "$CURRENT_USER" "$base_dir")
+      else
+        echo "warning: crs requires Grid Infrastructure environment, execute as a grid user" >&2
+        exit 1
+      fi
+      ;;
+    listener)
+      if [[ "$has_listener" == true ]]; then
+        readarray -t homes_listener < <(fetch_homes "listener" "$CURRENT_USER" "$base_dir")
+      else
+        echo "warning: listener requires Grid Infrastructure environment, execute as a grid user" >&2
+        exit 1
+      fi
+      ;;
+    all)
+      if [[ "$has_database" == true ]]; then
+        readarray -t homes_database < <(fetch_homes "database" "$CURRENT_USER" "$base_dir")
+      fi
+      if [[ "$has_asm" == true ]]; then
+        readarray -t homes_asm < <(fetch_homes "asm" "$CURRENT_USER" "$base_dir")
+      fi
+      if [[ "$has_crs" == true ]]; then
+        readarray -t homes_crs < <(fetch_homes "crs" "$CURRENT_USER" "$base_dir")
+      fi
+      if [[ "$has_listener" == true ]]; then
+        readarray -t homes_listener < <(fetch_homes "listener" "$CURRENT_USER" "$base_dir")
+      fi
+      ;;
+  esac
+else
+  # Fetch homes for available components in interactive mode
+  if [[ "$has_database" == true ]]; then
+    readarray -t homes_database < <(fetch_homes "database" "$CURRENT_USER" "$base_dir")
+  fi
+  if [[ "$has_asm" == true ]]; then
+    readarray -t homes_asm < <(fetch_homes "asm" "$CURRENT_USER" "$base_dir")
+  fi
+  if [[ "$has_crs" == true ]]; then
+    readarray -t homes_crs < <(fetch_homes "crs" "$CURRENT_USER" "$base_dir")
+  fi
+  if [[ "$has_listener" == true ]]; then
+    readarray -t homes_listener < <(fetch_homes "listener" "$CURRENT_USER" "$base_dir")
+  fi
+fi
+
+# Debug: Print homes
+# echo "debug: homes_database=${homes_database[*]:-}" >&2
+# echo "debug: homes_asm=${homes_asm[*]:-}" >&2
+# echo "debug: homes_crs=${homes_crs[*]:-}" >&2
+# echo "debug: homes_listener=${homes_listener[*]:-}" >&2
+
+# Warnings for unavailable components
+if [[ -z "$COMPONENT" || "$COMPONENT" == "asm" || "$COMPONENT" == "all" ]]; then
+  [[ "$has_asm" != true ]] && echo "warning: asm requires Grid Infrastructure environment, execute as a grid user"
+fi
+if [[ -z "$COMPONENT" || "$COMPONENT" == "crs" || "$COMPONENT" == "all" ]]; then
+  [[ "$has_crs" != true ]] && echo "warning: crs requires Grid Infrastructure environment, execute as a grid user"
+fi
+if [[ -z "$COMPONENT" || "$COMPONENT" == "listener" || "$COMPONENT" == "all" ]]; then
+  [[ "$has_listener" != true ]] && echo "warning: listener requires Grid Infrastructure environment, execute as a grid user"
+fi
+if [[ -z "$COMPONENT" || "$COMPONENT" == "database" || "$COMPONENT" == "all" ]]; then
+  [[ "$has_database" != true ]] && echo "warning: database requires Oracle Database environment, execute as a database user"
+fi
+
+# Check if no homes were found for the requested component
+if [[ -n "$COMPONENT" ]]; then
+  if [[ "$COMPONENT" == "asm" && ${#homes_asm[@]} -eq 0 ||
+        "$COMPONENT" == "database" && ${#homes_database[@]} -eq 0 ||
+        "$COMPONENT" == "crs" && ${#homes_crs[@]} -eq 0 ||
+        "$COMPONENT" == "listener" && ${#homes_listener[@]} -eq 0 ||
+        "$COMPONENT" == "all" && ${#homes_database[@]} -eq 0 && ${#homes_asm[@]} -eq 0 && ${#homes_crs[@]} -eq 0 && ${#homes_listener[@]} -eq 0 ]]; then
+    echo "error: No homes found for requested component, please enable adrci or check environment" >&2
+    exit 1
+  fi
+fi
+
+# Prepare zip tmp dir
+if [[ "$ZIP" == true ]]; then
+  TMPZIP=$(mktemp -d)
+  # echo "debug: Created tmp dir $TMPZIP" >&2
+  chmod 777 "$TMPZIP" 2>/dev/null || {
+    echo "warning: Unable to set permissions on $TMPZIP" >&2
+    ls -ld "$TMPZIP" >&2
+  }
+fi
+
+# If a component is specified, execute it directly
+if [[ -n "$COMPONENT" ]]; then
+  case "$COMPONENT" in
+    asm) display_logs asm "${homes_asm[@]}";;
+    database) display_logs database "${homes_database[@]}";;
+    crs) display_logs crs "${homes_crs[@]}";;
+    listener) display_logs listener "${homes_listener[@]}";;
+    all)
+      [[ ${#homes_database[@]} -gt 0 ]] && display_logs database "${homes_database[@]}"
+      [[ ${#homes_asm[@]} -gt 0 ]] && display_logs asm "${homes_asm[@]}"
+      [[ ${#homes_crs[@]} -gt 0 ]] && display_logs crs "${homes_crs[@]}"
+      [[ ${#homes_listener[@]} -gt 0 ]] && display_logs listener "${homes_listener[@]}"
+      ;;
+  esac
+else
+  # Interactive menu
+  if [[ ${#available_components[@]} -eq 0 ]]; then
+    echo "error: No components available for user $CURRENT_USER, check environment" >&2
+    exit 1
+  fi
+  echo -e "\n============================================================"
+  echo " Available components for user $CURRENT_USER"
+  echo -e "============================================================\n"
+  PS3=$'\nChoose your logfile: '
+  select opt in "${available_components[@]}"; do
+    case "$opt" in
+      asm) display_logs asm "${homes_asm[@]}"; break;;
+      database) display_logs database "${homes_database[@]}"; break;;
+      crs) display_logs crs "${homes_crs[@]}"; break;;
+      listener) display_logs listener "${homes_listener[@]}"; break;;
+      all)
+        [[ ${#homes_database[@]} -gt 0 ]] && display_logs database "${homes_database[@]}"
+        [[ ${#homes_asm[@]} -gt 0 ]] && display_logs asm "${homes_asm[@]}"
+        [[ ${#homes_crs[@]} -gt 0 ]] && display_logs crs "${homes_crs[@]}"
+        [[ ${#homes_listener[@]} -gt 0 ]] && display_logs listener "${homes_listener[@]}"
+        break;;
+      *) echo "error: Invalid option: $REPLY" >&2;;
+    esac
+  done
+fi
+
+# Zip after execution
 if [[ "$ZIP" == true ]]; then
   ZIPFILE="/tmp/logs_$(date +%Y%m%d_%H%M%S).zip"
-  (cd "$TMPZIP" && zip -r "$ZIPFILE" .)
-  echo "logs archived to $ZIPFILE"
-  rm -rf "$TMPZIP"
+  if [[ -d "$TMPZIP" && -n "$(ls -A "$TMPZIP")" ]]; then
+    # echo "debug: Creating zip file $ZIPFILE" >&2
+    if (cd "$TMPZIP" && zip -r "$ZIPFILE" .); then
+      echo -e "\nLogs archived to $ZIPFILE\n"
+    else
+      echo "warning: Unable to create zip file $ZIPFILE" >&2
+      ls -ld "$TMPZIP" >&2
+      ls -l "$TMPZIP" >&2
+    fi
+  else
+    echo "warning: No logs to zip in $TMPZIP" >&2
+    [[ -d "$TMPZIP" ]] && ls -ld "$TMPZIP" >&2
+  fi
+  rm -rf "$TMPZIP" 2>/dev/null
 fi
+
+echo -e "\n============================================================\n"
