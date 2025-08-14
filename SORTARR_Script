@@ -1,0 +1,103 @@
+#!/bin/bash
+
+#=====================================================
+# SORTARR Script for post sorting wrong saved media files
+# Author: Dennis Kolpatzki (Interactive Refactor)
+# Version: August 2025
+#=====================================================
+#!/usr/bin/env python3
+import os
+import requests
+import shutil
+
+# --- CONFIG ---
+TMDB_BEARER = input("Enter your TMDB Bearer Token: ").strip()
+SOURCE_DIR = input("Enter source folder path: ").strip()
+DEST_DIR = input("Enter destination folder path: ").strip()
+
+# Age filter input
+age_filter = input("Enter allowed age ratings (comma-separated, e.g. 0,6,12,G,PG): ").strip().split(",")
+age_filter = [a.strip().lower() for a in age_filter]
+
+# Optional genre filter
+genre_filter_input = input("Enter required genres (comma-separated, or leave blank for none): ").strip()
+genre_filter = [g.strip().lower() for g in genre_filter_input.split(",") if g.strip()]
+
+# --- FUNCTIONS ---
+def search_tmdb(movie_name):
+    """Search TMDB ID from movie name"""
+    url = f"https://api.themoviedb.org/3/search/movie?query={movie_name}&language=de-DE"
+    headers = {"Authorization": f"Bearer {TMDB_BEARER}"}
+    r = requests.get(url, headers=headers)
+    if r.status_code != 200 or not r.json().get("results"):
+        return None
+    return r.json()["results"][0]["id"]
+
+def get_movie_details(tmdb_id):
+    """Fetch genre list and age certification"""
+    url = f"https://api.themoviedb.org/3/movie/{tmdb_id}?language=de-DE&append_to_response=release_dates"
+    headers = {"Authorization": f"Bearer {TMDB_BEARER}"}
+    r = requests.get(url, headers=headers)
+    if r.status_code != 200:
+        return None, None
+    data = r.json()
+    genres = [g["name"] for g in data.get("genres", [])]
+    cert = ""
+    for country in ["DE", "US", "AU"]:
+        for entry in data.get("release_dates", {}).get("results", []):
+            if entry.get("iso_3166_1") == country:
+                if entry.get("release_dates"):
+                    cert = entry["release_dates"][0].get("certification", "")
+                break
+        if cert:
+            break
+    return genres, cert
+
+def matches_filter(genres, cert):
+    """Check if movie matches age and genre filters"""
+    genres_lower = [g.lower() for g in genres]
+
+    # Age filter first
+    if cert and cert.lower() not in age_filter:
+        return False
+
+    # Genre filter (if specified)
+    if genre_filter:
+        if not any(g in genres_lower for g in genre_filter):
+            return False
+
+    return True
+
+# --- MAIN LOGIC ---
+print(f"[INFO] Scanning '{SOURCE_DIR}'...")
+
+for folder in sorted(os.listdir(SOURCE_DIR)):
+    full_path = os.path.join(SOURCE_DIR, folder)
+    if not os.path.isdir(full_path):
+        continue
+
+    movie_name = folder.split("(")[0].strip()
+    print(f"\n🔍 Checking: {movie_name}")
+
+    tmdb_id = search_tmdb(movie_name)
+    if not tmdb_id:
+        print("  ⚠️ No TMDB ID found.")
+        continue
+
+    genres, cert = get_movie_details(tmdb_id)
+    if not genres:
+        print("  ⚠️ No details found.")
+        continue
+
+    print(f"  Genres: {genres}, Certification: {cert or 'N/A'}")
+
+    if matches_filter(genres, cert):
+        answer = input(f"  ➡️ '{folder}' matches your criteria. Move to destination? (y/n) ").strip().lower()
+        if answer == "y":
+            dest_path = os.path.join(DEST_DIR, folder)
+            print(f"  📦 Moving to: {dest_path}")
+            shutil.move(full_path, dest_path)
+        else:
+            print("  ❌ Skipped.")
+    else:
+        print("  ✅ Does not match criteria.")
