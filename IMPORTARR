@@ -1,0 +1,291 @@
+# Bulk Import Script (currently) for SONARR but could work for RADARR too with a few tweaks.
+# Use api to determine media file (series, episode, season); output his first match on given criteria 
+# if "y" import files into destination folder, if "n" provide next match until no more matches left.
+# Supports dry-run, tmdbid, path mapping
+# to do: clean queue feature
+
+#!/usr/bin/env python3
+import argparse, re, requests
+from pathlib import Path
+from time import sleep
+
+API_URL = "http://localhost:8989/api/v3"
+API_KEY = ""
+headers = {"X-Api-Key": API_KEY}
+
+# Host → Container
+PATH_MAP = {
+    "/mnt/user/usenet/complete": "/data/complete",
+    "/mnt/cache/usenet/complete": "/data/complete",
+}
+
+VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".mov"}
+PREFIX_RE  = re.compile(r"^(.*?)(S\d{1,2}E\d{1,2})", re.IGNORECASE)
+
+# ---------- helpers ----------
+def map_path_to_container(host_path: Path) -> str:
+    s = str(host_path)
+    for hp, cp in PATH_MAP.items():
+        if s.startswith(hp):
+            m = s.replace(hp, cp, 1)
+            print(f"🔄 Path Mapping: {s} → {m}")
+            return m
+    print(f"⚠️ Kein Path Mapping gefunden für: {s}")
+    return s
+
+def sonarr_lookup(term, restrict_ids=None):
+    r = requests.get(f"{API_URL}/series/lookup", headers=headers, params={"term": term})
+    r.raise_for_status()
+    res = r.json()
+    if restrict_ids:
+        out = []
+        for x in res:
+            if (f"tvdb:{x.get('tvdbId')}" in restrict_ids) or (f"tmdb:{x.get('tmdbId')}" in restrict_ids):
+                out.append(x)
+        return out
+    return res
+
+def get_library_series_by_ids(tvdb_id=None, tmdb_id=None):
+    r = requests.get(f"{API_URL}/series", headers=headers)
+    r.raise_for_status()
+    for s in r.json():
+        if tvdb_id and s.get("tvdbId") == tvdb_id: return s
+        if tmdb_id and s.get("tmdbId") == tmdb_id: return s
+    return None
+
+def fetch_languages():
+    r = requests.get(f"{API_URL}/language", headers=headers)
+    r.raise_for_status()
+    langs = r.json()
+    # Map per Name (lower)
+    m = { (l.get("name") or "").lower(): l for l in langs }
+    # Falls „Original“/„Unknown“ anders benannt sind → auch lowercase-keys einmalig
+    for l in langs:
+        for k in ("englishName",):
+            v = (l.get(k) or "").lower()
+            if v and v not in m: m[v] = l
+    return langs, m
+
+def detect_language_objs(filename: str, lang_map: dict):
+    n = filename.lower()
+    if "german" in n or ".ger" in n or "german." in n:
+        key = "german"
+    elif "english" in n or ".eng" in n or "english." in n:
+        key = "english"
+    else:
+        key = "unknown"
+    # Rückgabe: Liste von Language-Objekten (nicht Strings!)
+    if key in lang_map:
+        return [lang_map[key]]
+    # robustes Fallback
+    for k in ("unknown", "original"):
+        if k in lang_map:
+            return [lang_map[k]]
+    # letztes Fallback – Sonarr mag kein null -> nimm Unknown-ähnlichstes
+    return [{"id": 0, "name": "Unknown"}]
+
+def find_episode(series_id: int, file_name: str):
+    m = re.search(r"[Ss](\d{1,2})[Ee](\d{1,2})", file_name)
+    if not m: return None, None, None
+    season, epnum = int(m.group(1)), int(m.group(2))
+    r = requests.get(f"{API_URL}/episode", headers=headers, params={"seriesId": series_id})
+    r.raise_for_status()
+    for ep in r.json():
+        if ep["seasonNumber"] == season and ep["episodeNumber"] == epnum:
+            return season, epnum, ep
+    return season, epnum, None
+
+def build_quality(file_name: str):
+    q = "Unknown"; n = file_name.lower()
+    if "2160p" in n or "4k" in n: q = "WEBDL-2160p"
+    elif "1080p" in n:           q = "WEBDL-1080p"
+    elif "720p"  in n:           q = "WEBDL-720p"
+    return {"quality": {"name": q}, "revision": {"version": 1, "real": 0, "isRepack": False}}
+
+def release_group_from_name(file_name: str):
+    m = re.search(r"-([A-Za-z0-9]+)(?:\.[^.]+)?$", file_name)
+    return m.group(1) if m else None
+
+def clean_queue(series_id: int = None, hint: str = None, remove_from_client: bool = True):
+    """
+    Entfernt passende Einträge aus Sonarrs Warteschlange.
+    - bevorzugt per seriesId
+    - fallback: Titel enthält hint (z. B. 'Bluey.2019')
+    """
+    try:
+        r = requests.get(f"{API_URL}/queue", headers=headers)
+        r.raise_for_status()
+        items = r.json()
+    except Exception as e:
+        print(f"⚠️ Queue konnte nicht gelesen werden: {e}")
+        return
+
+    removed = 0
+    for it in items:
+        title = (it.get("title") or "").lower()
+        sid   = it.get("seriesId")
+        match = False
+
+        if series_id is not None and sid == series_id:
+            match = True
+        elif hint:
+            match = hint.lower() in title
+
+        if match:
+            qid = it["id"]
+            try:
+                requests.delete(
+                    f"{API_URL}/queue/{qid}",
+                    headers=headers,
+                    params={"removeFromClient": str(remove_from_client).lower()}
+                )
+                removed += 1
+            except Exception as e:
+                print(f"⚠️ Konnte Queue-Item {qid} nicht löschen: {e}")
+
+    if removed:
+        print(f"🧹 Queue aufgeräumt: {removed} Einträge entfernt.")
+    else:
+        print("🧹 Queue: nichts zu entfernen.")
+
+
+# ---------- core ----------
+def import_via_command(container_path: str, series: dict, episode: dict, quality: dict,
+                       import_mode: str, release_group: str, languages: list,
+                       clean_after: bool = True, queue_hint: str | None = None):
+    payload = {
+        "name": "manualImport",
+        "importMode": import_mode,
+        "files": [{
+            "path": container_path,
+            "seriesId": series["id"],
+            "episodeIds": [episode["id"]],
+            "quality": quality,
+            "languages": languages,
+            "releaseGroup": release_group
+        }]
+    }
+
+    print(f"🚀 POST /command → {Path(container_path).name}")
+    r = requests.post(f"{API_URL}/command", headers=headers, json=payload)
+    if r.status_code == 201:
+        print("✅ Manual-Import akzeptiert.")
+        if clean_after:
+            clean_queue(series_id=series["id"], hint=queue_hint, remove_from_client=True)
+        return True
+    else:
+        print(f"❌ Import fehlgeschlagen: {r.status_code}")
+        print(r.text[:400])
+        return False
+
+
+def process_file(series: dict, host_file: Path, import_mode: str, dry_run: bool, lang_map: dict):
+    if host_file.suffix.lower() not in VIDEO_EXTS: return
+    if "sample" in host_file.name.lower(): return
+
+    print(f"\n🔄 Verarbeite {host_file.name}…")
+    cont_path = map_path_to_container(host_file)
+
+    season, epnum, ep = find_episode(series["id"], host_file.name)
+    if not ep:
+        if season and epnum:
+            print(f"❌ Episode S{season:02d}E{epnum:02d} nicht in Sonarr gefunden")
+        else:
+            print("❌ Konnte SxxExx nicht aus Dateinamen lesen")
+        return
+
+    print(f"✅ Episode: {ep['title']} (ID: {ep['id']})")
+    quality = build_quality(host_file.name)
+    rg      = release_group_from_name(host_file.name)
+    langs   = detect_language_objs(host_file.name, lang_map)
+
+    if dry_run:
+        print(f"💡 DRY-RUN → path={cont_path}, epIds={[ep['id']]}, quality={quality['quality']['name']}, langs={[l['name'] for l in langs]}, rg={rg}, mode={import_mode}")
+        return
+
+    ok = import_via_command(cont_path, series, ep, quality, import_mode, rg, langs)
+    if ok:  print(f"🎉 Import angestoßen: {host_file.name} → {series['title']}")
+    else:   print(f"💥 Import gescheitert: {host_file.name}")
+
+# ---------- CLI ----------
+def parse_args():
+    ap = argparse.ArgumentParser(description="Sonarr CLI Manual Import (mit Languages)")
+    ap.add_argument("base", help="Basisordner")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--ids", help="Filter: tvdb:1234,tmdb:5678")
+    ap.add_argument("--copy", action="store_true", help="Kopieren statt Verschieben")
+    ap.add_argument("--map-add", help="host:container Mapping ergänzen")
+    ap.add_argument("--print-languages", action="store_true", help="Nur Languages anzeigen und beenden")
+    return ap.parse_args()
+
+def main():
+    args = parse_args()
+    base = Path(args.base)
+    restrict_ids = args.ids.split(",") if args.ids else None
+    import_mode  = "Copy" if args.copy else "Move"
+
+    if args.map_add:
+        hp, cp = args.map_add.split(":")
+        PATH_MAP[hp] = cp
+        print(f"➕ Mapping: {hp} → {cp}")
+
+    print(f"📂 Scanning {base}…")
+    print(f"🔧 API: {API_URL}")
+    print("🗂️ Mappings:")
+    for h, c in PATH_MAP.items(): print(f"   {h} → {c}")
+
+    # API check
+    requests.get(f"{API_URL}/system/status", headers=headers).raise_for_status()
+    print("✅ Sonarr API ok")
+
+    langs, lang_map = fetch_languages()
+    if args.print_languages:
+        print("🌐 Sonarr Languages:")
+        for l in langs: print(f"   id={l.get('id')}  name={l.get('name')}")
+        return
+
+    cache = {}
+    for f in sorted(base.glob("**/*")):
+        if not f.is_file() or f.suffix.lower() not in VIDEO_EXTS: continue
+        if "sample" in f.name.lower(): continue
+        m = PREFIX_RE.match(f.name)
+        if not m:
+            print(f"❌ Keine Prefix-Treffer für {f.name}")
+            continue
+        prefix = m.group(1).rstrip(" ._-")
+
+        if prefix in cache:
+            print(f"🔁 Verwende gecachte Serie '{prefix}' → {cache[prefix]['title']}")
+            process_file(cache[prefix], f, import_mode, args.dry_run, lang_map)
+            continue
+
+        print(f"🔍 Suche Serie für Prefix: '{prefix}'")
+        results = sonarr_lookup(prefix, restrict_ids)
+        if not results:
+            print(f"❌ Keine Treffer für {f.name}")
+            continue
+
+        chosen = None
+        for i, r in enumerate(results, 1):
+            title, year = r.get("title"), r.get("year")
+            tvdb_id, tmdb_id = r.get("tvdbId"), r.get("tmdbId")
+            print(f"\n🎬 Option {i}: {f.name}")
+            print(f"   Serie: {title} ({year})  TVDB:{tvdb_id} TMDB:{tmdb_id}")
+            ans = input("Ist das die richtige Serie? (y/n/s=skip): ").strip().lower()
+            if ans == "y":
+                lib = get_library_series_by_ids(tvdb_id, tmdb_id)
+                if not lib:
+                    print("❌ Serie nicht in der Library – bitte erst hinzufügen.")
+                    break
+                cache[prefix] = lib
+                chosen = lib
+                break
+            if ans == "s":
+                print(f"⏭️ Übersprungen: {f.name}")
+                break
+
+        if chosen:
+            process_file(chosen, f, import_mode, args.dry_run, lang_map)
+
+if __name__ == "__main__":
+    main()
